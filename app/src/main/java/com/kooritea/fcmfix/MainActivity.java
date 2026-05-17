@@ -12,6 +12,7 @@ import android.content.pm.PackageManager;
 import android.graphics.drawable.Drawable;
 import android.os.Bundle;
 import android.os.Handler;
+import android.os.Parcelable;
 import android.util.AttributeSet;
 import android.util.Log;
 import android.view.LayoutInflater;
@@ -51,8 +52,13 @@ import com.kooritea.fcmfix.util.IceboxUtils;
 public class MainActivity extends AppCompatActivity {
     private AppListAdapter appListAdapter;
     private static XposedService xposedService;
-    Set<String> allowList = new HashSet<>();
-    JSONObject config = new JSONObject();
+    private Set<String> allowList = new HashSet<>();
+    private Set<String> processedFcmApps = new HashSet<>();
+    private JSONObject config = new JSONObject();
+    
+    private RecyclerView recyclerView;
+    private Handler handler = new Handler();
+    private Runnable fallbackLoader;
 
     private SharedPreferences getRemotePreferencesOrNull() {
         if (xposedService == null) {
@@ -73,10 +79,25 @@ public class MainActivity extends AppCompatActivity {
                 public void onServiceBind(@NonNull XposedService service) {
                     xposedService = service;
                     runOnUiThread(() -> {
+                        handler.removeCallbacks(fallbackLoader);
                         loadConfigFromRemotePreferences();
-                        if (appListAdapter != null) {
-                            appListAdapter.notifyDataSetChanged();
+                        
+                        Parcelable recyclerViewState = null;
+                        if (recyclerView.getLayoutManager() != null) {
+                            recyclerViewState = recyclerView.getLayoutManager().onSaveInstanceState();
                         }
+
+                        appListAdapter = new AppListAdapter();
+                        recyclerView.setAdapter(appListAdapter);
+                        
+                        if (recyclerViewState != null) {
+                            recyclerView.getLayoutManager().onRestoreInstanceState(recyclerViewState);
+                        }
+
+                        findViewById(R.id.progress_bar).setVisibility(View.GONE);
+                        recyclerView.setVisibility(View.VISIBLE);
+                        
+                        autoSelectFcmApps();
                     });
                 }
 
@@ -119,6 +140,10 @@ public class MainActivity extends AppCompatActivity {
         }
         this.allowList.clear();
         this.allowList.addAll(pref.getStringSet("allowList", new HashSet<>()));
+        
+        this.processedFcmApps.clear();
+        this.processedFcmApps.addAll(pref.getStringSet("processedFcmApps", new HashSet<>()));
+        
         try {
             this.config.put("allowList", new JSONArray(this.allowList));
             this.config.put("disableAutoCleanNotification", pref.getBoolean("disableAutoCleanNotification", false));
@@ -126,6 +151,40 @@ public class MainActivity extends AppCompatActivity {
             this.config.put("noResponseNotification", pref.getBoolean("noResponseNotification", false));
         } catch (JSONException e) {
             Log.e("loadRemoteConfig", e.toString());
+        }
+    }
+
+    private void autoSelectFcmApps() {
+        if (appListAdapter == null || appListAdapter.mAppList == null) return;
+        boolean isModified = false;
+        for (AppInfo appInfo : appListAdapter.mAppList) {
+            if (appInfo.includeFcm && !processedFcmApps.contains(appInfo.packageName)) {
+                allowList.add(appInfo.packageName);
+                processedFcmApps.add(appInfo.packageName);
+                appInfo.isAllow = true;
+                isModified = true;
+            }
+        }
+        if (isModified) {
+            updateConfig();
+            appListAdapter.notifyDataSetChanged();
+        }
+    }
+
+    private void selectAllFcmApps() {
+        if (appListAdapter == null || appListAdapter.mAppList == null) return;
+        boolean isModified = false;
+        for (AppInfo appInfo : appListAdapter.mAppList) {
+            if (appInfo.includeFcm && !appInfo.isAllow) {
+                allowList.add(appInfo.packageName);
+                processedFcmApps.add(appInfo.packageName);
+                appInfo.isAllow = true;
+                isModified = true;
+            }
+        }
+        if (isModified) {
+            updateConfig();
+            appListAdapter.notifyDataSetChanged();
         }
     }
 
@@ -143,7 +202,7 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    private class AppListAdapter  extends RecyclerView.Adapter<AppListAdapter.ViewHolder> {
+    private class AppListAdapter extends RecyclerView.Adapter<AppListAdapter.ViewHolder> {
 
         private final List<AppInfo> mAppList;
         class ViewHolder extends RecyclerView.ViewHolder {
@@ -167,7 +226,6 @@ public class MainActivity extends AppCompatActivity {
 
         public AppListAdapter(){
             Set<String> allowListSet = new HashSet<>(allowList);
-            allowListSet.containsAll(allowList);
             List<AppInfo> _allowList = new ArrayList<>();
             List<AppInfo> _notAllowList = new ArrayList<>();
             List<AppInfo> _notFoundFcm = new ArrayList<>();
@@ -176,7 +234,7 @@ public class MainActivity extends AppCompatActivity {
                 boolean flag = false;
                 AppInfo appInfo = new AppInfo(packageInfo);
                 if (packageInfo.receivers != null) {
-                    for (ActivityInfo  receiverInfo : packageInfo.receivers ){
+                    for (ActivityInfo receiverInfo : packageInfo.receivers ){
                         if(receiverInfo.name.equals("com.google.firebase.iid.FirebaseInstanceIdReceiver") || receiverInfo.name.equals("com.google.android.gms.measurement.AppMeasurementReceiver")){
                             flag = true;
                             appInfo.includeFcm = true;
@@ -268,7 +326,7 @@ public class MainActivity extends AppCompatActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
-        RecyclerView recyclerView = findViewById(R.id.recycler_view);
+        recyclerView = findViewById(R.id.recycler_view);
         recyclerView.setLayoutManager(new LinearLayoutManager(this));
 
         initXposedService();
@@ -280,12 +338,15 @@ public class MainActivity extends AppCompatActivity {
         } catch (Throwable ignored) {
         }
 
-        new Handler().postDelayed(() -> {
-            appListAdapter = new AppListAdapter();
-            recyclerView.setAdapter(appListAdapter);
-            findViewById(R.id.progress_bar).setVisibility(View.GONE);
-            recyclerView.setVisibility(View.VISIBLE);
-        }, 1000);
+        fallbackLoader = () -> {
+            if (appListAdapter == null) {
+                appListAdapter = new AppListAdapter();
+                recyclerView.setAdapter(appListAdapter);
+                findViewById(R.id.progress_bar).setVisibility(View.GONE);
+                recyclerView.setVisibility(View.VISIBLE);
+            }
+        };
+        handler.postDelayed(fallbackLoader, 1000);
     }
 
     @Nullable
@@ -296,8 +357,10 @@ public class MainActivity extends AppCompatActivity {
 
     private void addAppInAllowList(String packageName){
         this.allowList.add(packageName);
+        this.processedFcmApps.add(packageName); 
         this.updateConfig();
     }
+    
     private void deleteAppInAllowList(String packageName){
         this.allowList.remove(packageName);
         this.updateConfig();
@@ -313,6 +376,7 @@ public class MainActivity extends AppCompatActivity {
             boolean saved = pref.edit()
                     .putBoolean("init", true)
                     .putStringSet("allowList", new HashSet<>(this.allowList))
+                    .putStringSet("processedFcmApps", new HashSet<>(this.processedFcmApps))
                     .putBoolean("disableAutoCleanNotification", this.config.getBoolean("disableAutoCleanNotification"))
                     .putBoolean("includeIceBoxDisableApp", this.config.getBoolean("includeIceBoxDisableApp"))
                     .putBoolean("noResponseNotification", this.config.getBoolean("noResponseNotification"))
@@ -330,15 +394,10 @@ public class MainActivity extends AppCompatActivity {
     @Override
     public boolean onCreateOptionsMenu (Menu menu){
 //      menu.add("隐藏启动器图标").setCheckable(true);
-
         menu.add("阻止应用停止时自动清除通知").setCheckable(true);
-
         menu.add("允许唤醒被冰箱冻结的应用").setCheckable(true);
-
-//        menu.add("目标无响应时代发提示通知").setCheckable(true);
-
+//      menu.add("目标无响应时代发提示通知").setCheckable(true);
         menu.add("全选包含 FCM 的应用");
-
         menu.add("打开FCM Diagnostics");
         return true;
     }
@@ -375,13 +434,7 @@ public class MainActivity extends AppCompatActivity {
             }
             if("全选包含 FCM 的应用".equals(item.getTitle())){
                 item.setOnMenuItemClickListener(menuItem -> {
-                    for(AppInfo appInfo : appListAdapter.mAppList){
-                        if(appInfo.includeFcm){
-                            addAppInAllowList(appInfo.packageName);
-                            appInfo.isAllow = true;
-                        }
-                    }
-                    appListAdapter.notifyDataSetChanged();
+                    selectAllFcmApps();
                     return false;
                 });
             }
